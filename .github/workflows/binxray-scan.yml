@@ -1,0 +1,89 @@
+name: BinXray scan
+
+# Builds cJSON, then scans the built binaries with a BinXray server and fails the build on severe findings.
+# The scan step needs three settings you add in the repository (Settings > Secrets and variables > Actions):
+#   secret   BINXRAY_API_URL          base URL of your BinXray server (kept secret so it is not published in a public repo)
+#   secret   BINXRAY_API_KEY          an API key from that server (optional; without it the server treats the run as an anonymous guest)
+#   variable BINXRAY_EULA_ACCEPTED    set to "true" after you have read the BinXray EULA (the server refuses uploads without it)
+#   variable BINXRAY_FAIL_ON          critical (default) | high | none
+# Without them the scan step is skipped and the run stays green. See .github/BINXRAY_CI.md.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+
+concurrency:
+  group: binxray-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build cJSON (release, shared library)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DENABLE_CJSON_UTILS=ON -DENABLE_CJSON_TEST=ON
+          cmake --build build -j"$(nproc)"
+      - name: Collect the built ELF binaries
+        run: |
+          mkdir -p dist
+          find build -maxdepth 2 -type f \( -name 'libcjson*.so.*' -o -name 'cJSON_test' \) -exec cp -v {} dist/ \;
+          for f in dist/*; do file "$f" | grep -q ELF || { echo "not an ELF file, dropping: $f"; rm -f "$f"; }; done
+          ls -l dist
+          test -n "$(ls -A dist)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cjson-binaries
+          path: dist/
+          if-no-files-found: error
+
+  scanner-selftest:
+    # Proves the scan script itself (upload contract, gate levels, exit codes) against a mock server. No BinXray server or secrets needed.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cjson-binaries
+          path: dist
+      - run: python3 -m pip install --quiet requests
+      - name: Run the scanner self-test on a real built binary
+        run: python3 .github/scripts/test_binxray_scan.py "$(ls dist/libcjson*.so.* | head -1)"
+
+  binxray-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      BINXRAY_API_URL: ${{ secrets.BINXRAY_API_URL }}
+      BINXRAY_API_KEY: ${{ secrets.BINXRAY_API_KEY }}
+      BINXRAY_EULA_ACCEPTED: ${{ vars.BINXRAY_EULA_ACCEPTED }}
+      FAIL_ON: ${{ vars.BINXRAY_FAIL_ON || 'critical' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cjson-binaries
+          path: dist
+      - run: python3 -m pip install --quiet requests
+      - name: Scan the built binaries with BinXray
+        run: python3 .github/scripts/binxray_scan.py dist/*
+      - name: Keep the BinXray results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: binxray-results
+          path: binxray-results/
+          if-no-files-found: ignore
